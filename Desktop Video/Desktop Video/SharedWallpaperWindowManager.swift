@@ -17,10 +17,8 @@ import Combine
 class SharedWallpaperWindowManager {
   static let shared = SharedWallpaperWindowManager()
 
-  /// 屏幕暂停状态集合
   private var pausedScreens: Set<String> = []
   
-  /// 防止全局静音状态循环更新的标志
   private var isUpdatingGlobalMute = false
 
   private var debounceWorkItem: DispatchWorkItem?
@@ -93,7 +91,6 @@ class SharedWallpaperWindowManager {
   @objc private func handleWake() {
     dlog("handling wake")
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-      // 唤醒后统一判断当前播放策略
       AppDelegate.shared?.updatePlaybackStateForAllScreens()
     }
   }
@@ -116,8 +113,6 @@ class SharedWallpaperWindowManager {
     cleanupDisconnectedScreens()
   }
 
-  /// Sync playback time for videos that share the same file name across screens.
-  /// 同步所有屏幕上相同文件名视频的播放进度。
   func syncSameNamedVideos() {
     dlog("syncSameNamedVideos invoked")
     // Group screen IDs by video file name
@@ -146,16 +141,14 @@ class SharedWallpaperWindowManager {
 
 //  private var cancellables: Set<AnyCancellable> = []
 
-  /// 全局静音前记录各屏幕的音量
   private var savedVolumes: [String: Float] = [:]
   private var currentViews: [String: NSView] = [:]
   private var loopers: [String: AVPlayerLooper] = [:]
   var windowControllers: [String: WallpaperWindowController] = [:]
-  /// 用于检测遮挡状态的小窗口（每个屏幕四个）
   var overlayWindows: [String: NSWindow] = [:]
-  /// 全屏覆盖窗口，用于屏保启动前的遮挡检测
   var screensaverOverlayWindows: [String: NSWindow] = [:]
   var players: [String: AVQueuePlayer] = [:]
+    var playbackRates: [String: Float] = [:]
   private let videoDataCache = NSCache<NSURL, NSData>()
   var screenContent: [String: (type: ContentType, url: URL, stretch: Bool, volume: Float?)] = [:]
 
@@ -212,7 +205,6 @@ class SharedWallpaperWindowManager {
     win.contentView = NSView(frame: screenFrame)
     win.orderFrontRegardless()
 
-    // 创建一个用于检测遮挡状态的透明窗口
     let rawSensitivity = AppState.shared.idlePauseSensitivity
     let portionSize = 1 - rawSensitivity / 200.0
 
@@ -229,7 +221,7 @@ class SharedWallpaperWindowManager {
       styleMask: .borderless,
       backing: .buffered,
       defer: false)
-    // overlay 必须高于 screensaverOverlay，但仍低于普通窗口
+
     overlay.level = NSWindow.Level(Int(CGWindowLevelForKey(.desktopWindow))) + 2
     overlay.isOpaque = false
     overlay.backgroundColor = .clear  // keep fully transparent for occlusion checks
@@ -258,13 +250,11 @@ class SharedWallpaperWindowManager {
       object: nil
     )
 
-    // 创建用于屏保检测的全屏透明窗口
     let screensaverOverlay = NSWindow(
       contentRect: screenFrame,
       styleMask: .borderless,
       backing: .buffered,
       defer: false)
-    // screensaverOverlay 位于 overlay 之下、壁纸窗口之上
     screensaverOverlay.level = NSWindow.Level(Int(CGWindowLevelForKey(.desktopWindow))) + 1
     screensaverOverlay.isOpaque = false
     screensaverOverlay.backgroundColor = .clear
@@ -279,7 +269,6 @@ class SharedWallpaperWindowManager {
     self.overlayWindows[sid] = overlay
     self.screensaverOverlayWindows[sid] = screensaverOverlay
 
-    // 创建 / 恢复窗口后立即根据遮挡状态调整播放
     updatePlayState(for: screen)
     return controller
   }
@@ -321,7 +310,6 @@ class SharedWallpaperWindowManager {
     AppDelegate.shared?.startScreensaverTimer()
   }
 
-  /// 为指定屏幕播放视频，使用内存映射以减少磁盘读写。
   func showVideo(
     for screen: NSScreen, url: URL, stretch: Bool, volume: Float, allowReuse: Bool = true,
     onReady: (() -> Void)? = nil
@@ -571,38 +559,44 @@ class SharedWallpaperWindowManager {
   /// 根据 overlay 遮挡状态立即决定播放或暂停该屏幕的视频
   /// - Important: 该方法**只**影响当前屏幕，不会重建 playerItem，
   ///   避免 “恢复 B 导致 A 被唤醒” 的副作用。
-  private func updatePlayState(for screen: NSScreen) {
-    let sid = id(for: screen)
-    guard let player = players[sid] else { return }
+    private func updatePlayState(for screen: NSScreen) {
+        let sid = id(for: screen)
+        guard let player = players[sid] else { return }
 
-    switch playbackMode {
+        // 获取我们保存的速度，如果没有保存过，就默认 1.0
+        let targetRate = playbackRates[sid] ?? 1.0
 
-    case .alwaysPlay:
-      if player.timeControlStatus != .playing { player.play() }
+        switch playbackMode {
 
-    case .automatic:
-      // Delegate to existing global logic
-      AppDelegate.shared.updatePlaybackStateForAllScreens()
+        case .alwaysPlay:
+          // 修改点 1: 不用 player.play()，而是设置 rate
+          if player.timeControlStatus != .playing { player.rate = targetRate }
 
-    case .powerSave:
-      if allOverlaysCompletelyCovered() {
-        if player.timeControlStatus != .paused { player.pause() }
-      } else {
-        if player.timeControlStatus != .playing { player.play() }
+        case .automatic:
+          // Delegate to existing global logic
+          AppDelegate.shared.updatePlaybackStateForAllScreens()
+
+        case .powerSave:
+          if allOverlaysCompletelyCovered() {
+            if player.timeControlStatus != .paused { player.pause() }
+          } else {
+            // 修改点 2
+            if player.timeControlStatus != .playing { player.rate = targetRate }
+          }
+
+        case .powerSavePlus:
+          if anyOverlayCompletelyCovered() {
+            if player.timeControlStatus != .paused { player.pause() }
+          } else {
+            // 修改点 3
+            if player.timeControlStatus != .playing { player.rate = targetRate }
+          }
+
+        case .stationary:
+          player.pause()
+
+        }
       }
-
-    case .powerSavePlus:
-      if anyOverlayCompletelyCovered() {
-        if player.timeControlStatus != .paused { player.pause() }
-      } else {
-        if player.timeControlStatus != .playing { player.play() }
-      }
-
-    case .stationary:
-      player.pause()
-
-    }
-  }
 
   /// 供外部在遮挡状态变更时调用，确保每屏独立刷新
   // periphery:ignore - reserved for future
@@ -933,5 +927,26 @@ class SharedWallpaperWindowManager {
     // TODO: Implement actual overlay coverage check
     return false
   }
+    // MARK: - Playback Speed Control (New Feature)
 
-}
+      /// 设置指定屏幕的视频播放速度
+      /// - Parameters:
+      ///   - speed: 播放速率 (0.5 = 慢速, 1.0 = 正常, 2.0 = 快速)
+      ///   - screen: 目标屏幕
+      func setPlaybackSpeed(_ speed: Float, for screen: NSScreen) {
+        dlog("set playback speed to \(speed) for \(screen.dv_localizedName)")
+        let sid = id(for: screen)
+        
+        // 1. 记账：把速度存起来
+        playbackRates[sid] = speed
+        
+        // 2. 应用：如果播放器存在，立即应用新速度
+        if let player = players[sid] {
+          // 只有当视频不是暂停状态时，才应用速度（避免把暂停的视频突然播起来）
+          if player.timeControlStatus != .paused {
+            player.rate = speed
+          }
+        }
+      }
+    }
+

@@ -14,8 +14,12 @@ struct SingleScreenView: View {
     @State private var lastVolumeBeforeMute: Double = 100
     @State private var currentFileName: String = ""
     
+    // MARK: - 新增：倍速控制状态
+    @State private var selectedSpeed: Float = 1.0
+    private let playbackSpeeds: [Float] = [0.5, 1.0, 1.5, 2.0]
+    
     var body: some View {
-        VStack(alignment: .center, spacing: 16) {  // 增加垂直间距
+        VStack(alignment: .center, spacing: 16) {
             HStack(spacing: 8) {
                 Button(action: chooseMedia) { Text(L("Choose Video…")).font(.system(size: 15)) }
                 Button(action: clear) { Text(L("Clear")).font(.system(size: 15)) }
@@ -23,7 +27,9 @@ struct SingleScreenView: View {
                 Button(action: pause) { Text(L("Pause")).font(.system(size: 15)) }
                 Button(action: syncAll) { Text(L("Sync same videos")).font(.system(size: 15)) }
             }
-            .frame(minWidth: 400) // 保证按钮文字完整显示
+            .frame(minWidth: 400)
+            
+            // 2. 当前播放信息
             if !currentFileName.isEmpty {
                 HStack(spacing: 4) {
                     Text(LocalizedStringKey(L("NowPlaying"))).font(.system(size: 12))
@@ -31,7 +37,8 @@ struct SingleScreenView: View {
                 }
                 .foregroundStyle(.secondary)
             }
-            HStack(spacing: 8) {
+            
+            HStack(spacing: 12) {
                 SliderInputRow(title: LocalizedStringKey(L("Volume")), value: $volume, range: 0...100)
                     .disabled(isMuteEffective)
                     .onChange(of: volume) { newValue in
@@ -41,6 +48,19 @@ struct SingleScreenView: View {
                         SharedWallpaperWindowManager.shared.setVolume(Float(clamped / 100.0), for: screen)
                     }
 
+                Picker("", selection: $selectedSpeed) {
+                    ForEach(playbackSpeeds, id: \.self) { speed in
+                        Text("\(String(format: "%.1f", speed))x").tag(speed)
+                    }
+                }
+                .frame(width: 70)
+                .labelsHidden()
+                .onChange(of: selectedSpeed) { newSpeed in
+                    dlog("UI: Speed changed to \(newSpeed) for \(screen.dv_localizedName)")
+                    SharedWallpaperWindowManager.shared.setPlaybackSpeed(newSpeed, for: screen)
+                }
+
+                // 静音开关
                 Toggle(
                     LocalizedStringKey(L("Mute")),
                     isOn: Binding(
@@ -51,13 +71,14 @@ struct SingleScreenView: View {
                 .toggleStyle(.checkbox)
             }
             .font(.system(size: 15))
+            
             ToggleRow(title: LocalizedStringKey(L("Stretch to fill")), value: $stretchToFill)
                 .onChange(of: stretchToFill) { newValue in
                     updateStretch(newValue)
                 }
                 .font(.system(size: 15))
         }
-        .frame(minWidth: 440, maxWidth: 600) // 外层VStack宽度限制，防止内容被压缩
+        .frame(minWidth: 440, maxWidth: 600)
         .onAppear(perform: syncInitialState)
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("WallpaperContentDidChange"))) { _ in
             refreshStateFromManager()
@@ -76,7 +97,8 @@ struct SingleScreenView: View {
         }
     }
 
-    // 打开媒体选择面板并设置壁纸
+    // MARK: - Actions
+
     private func chooseMedia() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.movie, .video, .image]
@@ -94,32 +116,32 @@ struct SingleScreenView: View {
                         stretch: stretchToFill,
                         volume: isMuteEffective ? 0 : Float(volume / 100)
                     )
+
+                    SharedWallpaperWindowManager.shared.setPlaybackSpeed(selectedSpeed, for: screen)
                 }
             }
         }
     }
     
-    // 清除当前屏幕的壁纸
     private func clear() {
         dlog("clear wallpaper for \(screen.dv_localizedName)")
         SharedWallpaperWindowManager.shared.clear(for: screen)
     }
     
-    // 播放当前屏幕的壁纸
     private func play() {
         let sid = screen.dv_displayUUID
         dlog("play wallpaper for \(screen.dv_localizedName)")
+
         SharedWallpaperWindowManager.shared.players[sid]?.play()
+        SharedWallpaperWindowManager.shared.players[sid]?.rate = selectedSpeed
     }
     
-    // 暂停当前屏幕的壁纸
     private func pause() {
         let sid = screen.dv_displayUUID
         dlog("pause wallpaper for \(screen.dv_localizedName)")
         SharedWallpaperWindowManager.shared.players[sid]?.pause()
     }
 
-    // 将当前屏幕的视频同步到所有屏幕
     private func syncAll() {
         dlog("sync same-name videos across screens")
         SharedWallpaperWindowManager.shared.syncSameNamedVideos()
@@ -138,6 +160,7 @@ struct SingleScreenView: View {
                     stretch: stretch,
                     volume: isMuteEffective ? 0 : Float(volume / 100)
                 )
+                 SharedWallpaperWindowManager.shared.setPlaybackSpeed(selectedSpeed, for: screen)
             }
         }
         dlog("update stretch \(stretch) for \(screen.dv_localizedName)")
@@ -150,6 +173,7 @@ struct SingleScreenView: View {
 
     private func refreshStateFromManager() {
         let sid = screen.dv_displayUUID
+        
         if let player = SharedWallpaperWindowManager.shared.players[sid] {
             let newVolume = Double(player.volume * 100)
             volume = newVolume
@@ -160,13 +184,21 @@ struct SingleScreenView: View {
                 isLocallyMuted = player.volume == 0
             }
         }
+        
         if let entry = SharedWallpaperWindowManager.shared.screenContent[sid] {
             stretchToFill = entry.stretch
             currentFileName = entry.url.lastPathComponent
         } else {
             currentFileName = ""
         }
-        dlog("refresh state for \(screen.dv_localizedName) file=\(currentFileName) volume=\(Int(volume)) mute=\(isMuteEffective)")
+        
+        if let rate = SharedWallpaperWindowManager.shared.playbackRates[sid] {
+            selectedSpeed = rate
+        } else {
+            selectedSpeed = 1.0
+        }
+        
+        dlog("refresh state for \(screen.dv_localizedName) speed=\(selectedSpeed) file=\(currentFileName)")
     }
 
     private func handleMuteToggle(_ newValue: Bool) {
